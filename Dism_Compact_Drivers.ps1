@@ -1,9 +1,11 @@
-﻿# Definir caminho da pasta de origem e pasta de destino
-$origem = "C:\Drivers\3410"
-$destino = "D:\Temp\Latitude_3410\drivers.wim"
+# Solicitar o caminho da pasta de origem
+$origem = Read-Host "Digite o caminho da pasta de origem"
+
+# Solicitar o caminho do arquivo WIM de destino
+$destino = Read-Host "Digite o caminho do arquivo WIM de destino"
 
 # Comprimir a pasta de origem em um arquivo .wim usando o DISM
-$command = "dism /Capture-Image /ImageFile:$destino /CaptureDir:$origem /Compress:Max /Name:DRIVERS"
+$command = "dism /Capture-Image /ImageFile:`"$destino`" /CaptureDir:`"$origem`" /Compress:Max /Name:DRIVERS"
 Start-Process -FilePath "cmd.exe" -ArgumentList "/c $command" -Wait
 
 # Verificar se a captura foi bem-sucedida
