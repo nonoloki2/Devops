@@ -17,6 +17,6 @@ INNER JOIN v_R_System sys
     ON sys.ResourceID = fcm.ResourceID
 LEFT JOIN vAppDeploymentResultsPerClient app
     ON app.ResourceID = fcm.ResourceID
-    AND app.AssignmentID = 16792084
+    AND app.AssignmentID = 11582084
 WHERE fcm.CollectionID = 'CT10260E'
 ORDER BY sys.Name0
