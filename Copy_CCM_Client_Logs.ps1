@@ -1,4 +1,4 @@
-$Logshare = "\\CTSRV100\SLShare\CollectClientLog"
+$Logshare = "\\CTSRV100\LOGS\CollectClientLog"
 #Get path for SCCM client Log files
 $Logpath = Get-ItemProperty -path HKLM:\Software\Microsoft\CCM\Logging\@Global
 $Log = $logpath.LogDirectory
