@@ -6,7 +6,7 @@ $SiteCode = "CT0"
 Set-Location "$SiteCode`:"
 
 # Caminho da Device Collection
-$CollectionName = "SCTASK1902709-KB4052623"
+$CollectionName = "contoso-desktops"
 
 # Caminho do arquivo de hosts
 $HostsFile = "D:\Scripts\hosts.txt"
