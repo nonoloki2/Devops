@@ -2,7 +2,7 @@
 Import-Module "$($ENV:SMS_ADMIN_UI_PATH)\..\ConfigurationManager.psd1"
 
 # Define o site code do SCCM (ex: "ABC")
-$SiteCode = "PR1"
+$SiteCode = "CT0"
 Set-Location "$SiteCode`:"
 
 # Caminho da Device Collection
