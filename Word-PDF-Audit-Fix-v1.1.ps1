@@ -270,11 +270,17 @@ function Show-Snapshot {
         Write-Host ("Exists: {0}" -f $entry.Exists)
 
         if ($entry.Exists) {
-            if ($entry.Values.PSObject.Properties.Count -eq 0) {
+            # Avoid .Count on PSObject.Properties under StrictMode.
+            # Values is an OrderedDictionary; enumerate its keys safely.
+            $valueNames = @($entry.Values.Keys)
+
+            if ($valueNames.Count -eq 0) {
                 Write-Host "  <no values>"
             }
             else {
-                $entry.Values | Format-List
+                foreach ($name in $valueNames) {
+                    Write-Host ("  {0} : {1}" -f $name, $entry.Values[$name])
+                }
             }
         }
     }
@@ -545,8 +551,8 @@ try {
 
             $comparePath = Join-Path $env:TEMP "Word-PDF-Compare-$env:COMPUTERNAME-$((Get-Date).ToString('yyyyMMdd-HHmmss')).csv"
 
-            if ($differences.Count -gt 0) {
-                $differences | Export-Csv -Path $comparePath -NoTypeInformation -Encoding UTF8
+            if (@($differences).Count -gt 0) {
+                @($differences) | Export-Csv -Path $comparePath -NoTypeInformation -Encoding UTF8
                 Write-Host ""
                 Write-Host "Comparison CSV exported to:" -ForegroundColor Green
                 Write-Host "  $comparePath"
