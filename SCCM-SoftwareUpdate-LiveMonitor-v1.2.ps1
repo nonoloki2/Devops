@@ -64,6 +64,7 @@ $script:CimSession = $null
 $script:ConnectedComputer = $null
 $script:LastLogSignature = @{}
 $script:Busy = $false
+$script:CurrentUpdates = @()
 
 function Convert-ErrorCode {
     param([object]$Value)
@@ -238,30 +239,60 @@ function Get-LogRoot {
     return "\\$($script:ConnectedComputer)\c$\Windows\CCM\Logs"
 }
 
+function ConvertFrom-CMTraceLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $Line }
+
+    # Native CMTrace XML-ish format:
+    # <![LOG[message]LOG]!><time="13:20:24.437+240" date="08-13-2026" component="..." ...>
+    if ($Line -match '^\<\!\[LOG\[(?<msg>.*)\]LOG\]\!\>\<time="(?<time>[^"]+)".*component="(?<component>[^"]*)"') {
+
+        # IMPORTANT: copy the captures now. A second -match would overwrite $Matches.
+        $message   = [string]$Matches['msg']
+        $timeValue = [string]$Matches['time']
+        $component = [string]$Matches['component']
+
+        $displayTime = $timeValue
+        if ($timeValue -match '^(\d{2}:\d{2}:\d{2})') {
+            $displayTime = $Matches[1]
+        }
+
+        if ([string]::IsNullOrWhiteSpace($component)) {
+            return ('{0}  {1}' -f $displayTime, $message)
+        }
+
+        return ('{0}  [{1}]  {2}' -f $displayTime, $component, $message)
+    }
+
+    return $Line
+}
+
 function Get-InterestingLogLines {
     param(
         [string]$Path,
-        [int]$Tail = 120
+        [int]$Tail = 220
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
         return @("[Log not reachable] $Path")
     }
 
-    $lines = @(Get-Content -LiteralPath $Path -Tail $Tail -ErrorAction Stop)
+    $rawLines = @(Get-Content -LiteralPath $Path -Tail $Tail -ErrorAction Stop)
+    $lines = @($rawLines | ForEach-Object { ConvertFrom-CMTraceLine $_ })
 
-    # Keep important operational lines while still showing latest activity.
+    # Keep important operational lines while still showing recent context.
     $important = @(
         $lines | Where-Object {
-            $_ -match '(?i)install|download|percent|reboot|failed|failure|error|0x[0-9a-f]{8}|success|initiating|completed|state\s*='
+            $_ -match '(?i)install|actionable|download|percent|reboot|restart|failed|failure|error|0x[0-9a-f]{8}|success|initiating|completed|state\s*=|superseded'
         }
     )
 
     if ($important.Count -gt 0) {
-        return @($important | Select-Object -Last 60)
+        return @($important | Select-Object -Last 100)
     }
 
-    return @($lines | Select-Object -Last 40)
+    return @($lines | Select-Object -Last 60)
 }
 
 function Set-LogText {
@@ -300,11 +331,78 @@ function Set-LogText {
     }
 }
 
+
+function Invoke-InstallSoftwareUpdates {
+    param(
+        [object[]]$Updates
+    )
+
+    if (-not $Updates -or $Updates.Count -eq 0) {
+        throw 'No software updates were selected.'
+    }
+
+    # Microsoft ConfigMgr Client SDK:
+    # root\ccm\ClientSDK:CCM_SoftwareUpdatesManager.InstallUpdates(CCM_SoftwareUpdate[])
+    if ($script:CimSession) {
+        $manager = Get-CimClass -CimSession $script:CimSession `
+            -Namespace 'root\ccm\ClientSDK' `
+            -ClassName 'CCM_SoftwareUpdatesManager' `
+            -ErrorAction Stop
+
+        $result = Invoke-CimMethod `
+            -CimSession $script:CimSession `
+            -CimClass $manager `
+            -MethodName 'InstallUpdates' `
+            -Arguments @{ CCMUpdates = [ciminstance[]]$Updates } `
+            -ErrorAction Stop
+    }
+    else {
+        $manager = Get-CimClass `
+            -Namespace 'root\ccm\ClientSDK' `
+            -ClassName 'CCM_SoftwareUpdatesManager' `
+            -ErrorAction Stop
+
+        $result = Invoke-CimMethod `
+            -CimClass $manager `
+            -MethodName 'InstallUpdates' `
+            -Arguments @{ CCMUpdates = [ciminstance[]]$Updates } `
+            -ErrorAction Stop
+    }
+
+    return $result
+}
+
+function Get-SelectedUpdateObjects {
+    param([object[]]$AllUpdates)
+
+    $selected = @()
+    foreach ($row in $grid.SelectedRows) {
+        $updateId = [string]$row.Tag
+        if (-not [string]::IsNullOrWhiteSpace($updateId)) {
+            $obj = $AllUpdates | Where-Object { [string]$_.UpdateID -eq $updateId } | Select-Object -First 1
+            if ($obj) { $selected += $obj }
+        }
+    }
+    return @($selected)
+}
+
+function Get-InstallableUpdates {
+    param([object[]]$AllUpdates)
+
+    # Only updates currently exposed by CCM_SoftwareUpdate and not already
+    # installing/completed/error/reboot states.
+    return @(
+        $AllUpdates | Where-Object {
+            [int]$_.EvaluationState -notin 7,8,9,10,11,12,13
+        }
+    )
+}
+
 # -----------------------------
 # Form
 # -----------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'SCCM Software Update Live Monitor'
+$form.Text = 'SCCM Software Update Live Monitor v1.2'
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(1420, 900)
 $form.MinimumSize = New-Object System.Drawing.Size(1180, 720)
@@ -319,7 +417,7 @@ $topPanel.BackColor = [System.Drawing.Color]::White
 $form.Controls.Add($topPanel)
 
 $title = New-Object System.Windows.Forms.Label
-$title.Text = 'SCCM Software Update Live Monitor'
+$title.Text = 'SCCM Software Update Live Monitor v1.2'
 $title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
 $title.Left = 16
 $title.Top = 9
@@ -357,6 +455,24 @@ $btnRefresh.Width = 100
 $btnRefresh.Height = 28
 $btnRefresh.Enabled = $false
 $topPanel.Controls.Add($btnRefresh)
+
+$btnInstallSelected = New-Object System.Windows.Forms.Button
+$btnInstallSelected.Text = 'Install Selected'
+$btnInstallSelected.Left = 1138
+$btnInstallSelected.Top = 8
+$btnInstallSelected.Width = 120
+$btnInstallSelected.Height = 28
+$btnInstallSelected.Enabled = $false
+$topPanel.Controls.Add($btnInstallSelected)
+
+$btnInstallAll = New-Object System.Windows.Forms.Button
+$btnInstallAll.Text = 'Install All'
+$btnInstallAll.Left = 1264
+$btnInstallAll.Top = 8
+$btnInstallAll.Width = 95
+$btnInstallAll.Height = 28
+$btnInstallAll.Enabled = $false
+$topPanel.Controls.Add($btnInstallAll)
 
 $chkAuto = New-Object System.Windows.Forms.CheckBox
 $chkAuto.Text = 'Auto refresh'
@@ -411,11 +527,33 @@ $main.Dock = 'Fill'
 $main.Padding = New-Object System.Windows.Forms.Padding(12)
 $form.Controls.Add($main)
 
+# Explicit row layout prevents the SplitContainer from rendering underneath
+# the summary/service panels (the v1.1 blank-grid bug).
+$contentLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$contentLayout.Dock = 'Fill'
+$contentLayout.ColumnCount = 1
+$contentLayout.RowCount = 3
+$contentLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+$contentLayout.Padding = New-Object System.Windows.Forms.Padding(0)
+[void]$contentLayout.ColumnStyles.Add(
+    (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))
+)
+[void]$contentLayout.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 78))
+)
+[void]$contentLayout.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 38))
+)
+[void]$contentLayout.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))
+)
+$main.Controls.Add($contentLayout)
+
 # Summary
 $summaryPanel = New-Object System.Windows.Forms.Panel
-$summaryPanel.Dock = 'Top'
-$summaryPanel.Height = 78
-$main.Controls.Add($summaryPanel)
+$summaryPanel.Dock = 'Fill'
+$summaryPanel.Margin = New-Object System.Windows.Forms.Padding(0)
+$contentLayout.Controls.Add($summaryPanel, 0, 0)
 
 $cards = @{}
 $x = 0
@@ -436,9 +574,9 @@ foreach ($item in @(
 
 # Services status
 $servicePanel = New-Object System.Windows.Forms.Panel
-$servicePanel.Dock = 'Top'
-$servicePanel.Height = 38
-$main.Controls.Add($servicePanel)
+$servicePanel.Dock = 'Fill'
+$servicePanel.Margin = New-Object System.Windows.Forms.Padding(0)
+$contentLayout.Controls.Add($servicePanel, 0, 1)
 
 $lblServices = New-Object System.Windows.Forms.Label
 $lblServices.Text = 'Services:'
@@ -464,11 +602,12 @@ foreach ($svc in @('CcmExec','DoSvc','wuauserv','BITS')) {
 # Split container
 $split = New-Object System.Windows.Forms.SplitContainer
 $split.Dock = 'Fill'
+$split.Margin = New-Object System.Windows.Forms.Padding(0)
 $split.Orientation = 'Horizontal'
 $split.SplitterDistance = 390
 $split.Panel1MinSize = 220
 $split.Panel2MinSize = 190
-$main.Controls.Add($split)
+$contentLayout.Controls.Add($split, 0, 2)
 
 # Grid
 $grid = New-Object System.Windows.Forms.DataGridView
@@ -478,13 +617,17 @@ $grid.AllowUserToDeleteRows = $false
 $grid.AllowUserToOrderColumns = $true
 $grid.ReadOnly = $true
 $grid.SelectionMode = 'FullRowSelect'
-$grid.MultiSelect = $false
+$grid.MultiSelect = $true
 $grid.AutoSizeColumnsMode = 'Fill'
 $grid.RowHeadersVisible = $false
 $grid.BackgroundColor = [System.Drawing.Color]::White
 $grid.BorderStyle = 'FixedSingle'
 $grid.EnableHeadersVisualStyles = $false
 $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$grid.ColumnHeadersHeight = 30
+$grid.RowTemplate.Height = 28
+$grid.AutoGenerateColumns = $false
+$grid.Visible = $true
 $split.Panel1.Controls.Add($grid)
 
 [void]$grid.Columns.Add('KB','KB')
@@ -561,12 +704,13 @@ function Update-GridAndSummary {
             $kb,
             [string]$u.Name,
             $stateName,
-            [string]$u.PercentComplete,
+            ('{0}%' -f [int]$u.PercentComplete),
             $compliance,
             $errorText
         )
 
         $row = $grid.Rows[$idx]
+        $row.Tag = [string]$u.UpdateID
 
         switch ($category) {
             'Installing' {
@@ -641,9 +785,17 @@ function Refresh-Monitor {
 
     try {
         $updates = Get-ClientUpdates
+        $script:CurrentUpdates = @($updates)
         $services = Get-ClientServices
 
-        Update-GridAndSummary -Updates $updates
+        try {
+            Update-GridAndSummary -Updates $updates
+            $grid.Refresh()
+        }
+        catch {
+            throw "Grid update failed: $($_.Exception.Message)"
+        }
+
         Update-ServiceDisplay -Services $services
 
         $logRoot = Get-LogRoot
@@ -673,6 +825,10 @@ function Refresh-Monitor {
         else {
             $statusLabel.Text = 'LIVE: no active install at this instant'
         }
+
+        $installableCount = @(Get-InstallableUpdates -AllUpdates $updates).Count
+        $btnInstallSelected.Enabled = ($updates.Count -gt 0)
+        $btnInstallAll.Enabled = ($installableCount -gt 0)
 
         $lastRefresh.Text = 'Last refresh: ' + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     }
@@ -747,6 +903,119 @@ $txtComputer.Add_KeyDown({
     if ($_.KeyCode -eq 'Enter') {
         $btnConnect.PerformClick()
         $_.SuppressKeyPress = $true
+    }
+})
+
+$btnInstallSelected.Add_Click({
+    try {
+        if (-not $script:ConnectedComputer) { throw 'Connect to a computer first.' }
+
+        $selected = Get-SelectedUpdateObjects -AllUpdates $script:CurrentUpdates
+        if ($selected.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                'Select one or more updates in the grid first.',
+                'Install Selected',
+                'OK',
+                'Information'
+            ) | Out-Null
+            return
+        }
+
+        $names = ($selected | ForEach-Object { $_.Name }) -join "`r`n"
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "Start installation of the selected update(s) on $($script:ConnectedComputer)?`r`n`r`n$names",
+            'Confirm Installation',
+            'YesNo',
+            'Warning'
+        )
+
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        $btnInstallSelected.Enabled = $false
+        $btnInstallAll.Enabled = $false
+        $statusLabel.Text = "Submitting $($selected.Count) update(s) for installation..."
+
+        $result = Invoke-InstallSoftwareUpdates -Updates $selected
+        $rv = if ($null -ne $result.ReturnValue) { [uint32]$result.ReturnValue } else { 0 }
+
+        if ($rv -ne 0) {
+            throw ("InstallUpdates returned 0x{0:X8}" -f $rv)
+        }
+
+        $statusLabel.Text = "Install request accepted for $($selected.Count) update(s). Monitoring..."
+        Start-Sleep -Milliseconds 700
+        Refresh-Monitor
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            'Install Selected Error',
+            'OK',
+            'Error'
+        ) | Out-Null
+        $statusLabel.Text = 'Install request failed: ' + $_.Exception.Message
+    }
+    finally {
+        if ($script:ConnectedComputer) {
+            $btnInstallSelected.Enabled = $true
+            $btnInstallAll.Enabled = $true
+        }
+    }
+})
+
+$btnInstallAll.Add_Click({
+    try {
+        if (-not $script:ConnectedComputer) { throw 'Connect to a computer first.' }
+
+        $installable = Get-InstallableUpdates -AllUpdates $script:CurrentUpdates
+        if ($installable.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show(
+                'No currently installable software updates were returned by the ConfigMgr Client SDK.',
+                'Install All',
+                'OK',
+                'Information'
+            ) | Out-Null
+            return
+        }
+
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "Start installation of ALL $($installable.Count) currently installable update(s) on $($script:ConnectedComputer)?",
+            'Confirm Install All',
+            'YesNo',
+            'Warning'
+        )
+
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        $btnInstallSelected.Enabled = $false
+        $btnInstallAll.Enabled = $false
+        $statusLabel.Text = "Submitting all $($installable.Count) update(s) for installation..."
+
+        $result = Invoke-InstallSoftwareUpdates -Updates $installable
+        $rv = if ($null -ne $result.ReturnValue) { [uint32]$result.ReturnValue } else { 0 }
+
+        if ($rv -ne 0) {
+            throw ("InstallUpdates returned 0x{0:X8}" -f $rv)
+        }
+
+        $statusLabel.Text = "Install-all request accepted. Monitoring..."
+        Start-Sleep -Milliseconds 700
+        Refresh-Monitor
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            'Install All Error',
+            'OK',
+            'Error'
+        ) | Out-Null
+        $statusLabel.Text = 'Install-all request failed: ' + $_.Exception.Message
+    }
+    finally {
+        if ($script:ConnectedComputer) {
+            $btnInstallSelected.Enabled = $true
+            $btnInstallAll.Enabled = $true
+        }
     }
 })
 
