@@ -65,6 +65,8 @@ $script:ConnectedComputer = $null
 $script:LastLogSignature = @{}
 $script:Busy = $false
 $script:CurrentUpdates = @()
+$script:DOProgressHistory = @{}
+$script:DOStallMinutes = 5
 
 function Convert-ErrorCode {
     param([object]$Value)
@@ -247,17 +249,22 @@ function ConvertFrom-CMTraceLine {
     # Native CMTrace XML-ish format:
     # <![LOG[message]LOG]!><time="13:20:24.437+240" date="08-13-2026" component="..." ...>
     if ($Line -match '^\<\!\[LOG\[(?<msg>.*)\]LOG\]\!\>\<time="(?<time>[^"]+)".*component="(?<component>[^"]*)"') {
-        $t = $Matches['time']
-        if ($t -match '^(?<hhmmss>\d{2}:\d{2}:\d{2})') {
-            $t = $Matches['hhmmss']
+
+        # IMPORTANT: copy the captures now. A second -match would overwrite $Matches.
+        $message   = [string]$Matches['msg']
+        $timeValue = [string]$Matches['time']
+        $component = [string]$Matches['component']
+
+        $displayTime = $timeValue
+        if ($timeValue -match '^(\d{2}:\d{2}:\d{2})') {
+            $displayTime = $Matches[1]
         }
 
-        $component = $Matches['component']
         if ([string]::IsNullOrWhiteSpace($component)) {
-            return ('{0}  {1}' -f $t, $Matches['msg'])
+            return ('{0}  {1}' -f $displayTime, $message)
         }
 
-        return ('{0}  [{1}]  {2}' -f $t, $component, $Matches['msg'])
+        return ('{0}  [{1}]  {2}' -f $displayTime, $component, $message)
     }
 
     return $Line
@@ -393,11 +400,675 @@ function Get-InstallableUpdates {
     )
 }
 
+
+function Get-RemoteRegistryValue {
+    param(
+        [string]$SubKey,
+        [string]$ValueName,
+        [ValidateSet('DWORD','String')][string]$Type = 'String'
+    )
+
+    # HKLM = 2147483650
+    $hklm = [uint32]2147483650
+
+    try {
+        if ($script:CimSession) {
+            $regClass = Get-CimClass -CimSession $script:CimSession `
+                -Namespace 'root\default' -ClassName 'StdRegProv' -ErrorAction Stop
+            $args = @{ hDefKey = $hklm; sSubKeyName = $SubKey; sValueName = $ValueName }
+
+            if ($Type -eq 'DWORD') {
+                $r = Invoke-CimMethod -CimSession $script:CimSession -CimClass $regClass `
+                    -MethodName 'GetDWORDValue' -Arguments $args -ErrorAction Stop
+                if ($r.ReturnValue -eq 0) { return $r.uValue }
+            }
+            else {
+                $r = Invoke-CimMethod -CimSession $script:CimSession -CimClass $regClass `
+                    -MethodName 'GetStringValue' -Arguments $args -ErrorAction Stop
+                if ($r.ReturnValue -eq 0) { return $r.sValue }
+            }
+        }
+        else {
+            $regClass = Get-CimClass -Namespace 'root\default' -ClassName 'StdRegProv' -ErrorAction Stop
+            $args = @{ hDefKey = $hklm; sSubKeyName = $SubKey; sValueName = $ValueName }
+
+            if ($Type -eq 'DWORD') {
+                $r = Invoke-CimMethod -CimClass $regClass -MethodName 'GetDWORDValue' `
+                    -Arguments $args -ErrorAction Stop
+                if ($r.ReturnValue -eq 0) { return $r.uValue }
+            }
+            else {
+                $r = Invoke-CimMethod -CimClass $regClass -MethodName 'GetStringValue' `
+                    -Arguments $args -ErrorAction Stop
+                if ($r.ReturnValue -eq 0) { return $r.sValue }
+            }
+        }
+    }
+    catch {}
+
+    return $null
+}
+
+function Get-DOModeInfo {
+    param([object]$Mode)
+
+    if ($null -eq $Mode) {
+        return [pscustomobject]@{ Value = $null; Name = 'Not configured / unreadable' }
+    }
+
+    switch ([int]$Mode) {
+        0   { $name = 'HTTP only (no peer-to-peer)' }
+        1   { $name = 'LAN' }
+        2   { $name = 'Group' }
+        3   { $name = 'Internet' }
+        99  { $name = 'Simple / offline' }
+        100 { $name = 'Bypass (deprecated on Windows 11)' }
+        default { $name = 'Unknown' }
+    }
+
+    return [pscustomobject]@{ Value = [int]$Mode; Name = $name }
+}
+
+function Get-RemoteTcpListener {
+    param([int]$Port)
+
+    try {
+        if ($script:CimSession) {
+            $items = @(Get-CimInstance -CimSession $script:CimSession `
+                -Namespace 'root\StandardCimv2' `
+                -ClassName 'MSFT_NetTCPConnection' `
+                -Filter "LocalPort=$Port AND State=2" `
+                -ErrorAction Stop)
+        }
+        else {
+            $items = @(Get-CimInstance `
+                -Namespace 'root\StandardCimv2' `
+                -ClassName 'MSFT_NetTCPConnection' `
+                -Filter "LocalPort=$Port AND State=2" `
+                -ErrorAction Stop)
+        }
+        return ($items.Count -gt 0)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-DODeepMetrics {
+    # Local target: run DO cmdlets directly.
+    if ($script:ConnectedComputer -eq $env:COMPUTERNAME) {
+        try {
+            return [pscustomobject]@{
+                Available = $true
+                Method = 'Local PowerShell'
+                Status = @(Get-DeliveryOptimizationStatus -ErrorAction Stop)
+                Perf = Get-DeliveryOptimizationPerfSnap -ErrorAction Stop
+                Error = $null
+            }
+        }
+        catch {
+            return [pscustomobject]@{
+                Available = $false
+                Method = 'Local PowerShell'
+                Status = @()
+                Perf = $null
+                Error = $_.Exception.Message
+            }
+        }
+    }
+
+    # Remote target: try WinRM only for deep DO metrics. Core monitoring remains DCOM-based.
+    try {
+        $remote = Invoke-Command -ComputerName $script:ConnectedComputer -ErrorAction Stop -ScriptBlock {
+            $status = @(Get-DeliveryOptimizationStatus -ErrorAction Stop)
+            $perf = Get-DeliveryOptimizationPerfSnap -ErrorAction Stop
+
+            [pscustomobject]@{
+                Status = $status
+                Perf = $perf
+            }
+        }
+
+        return [pscustomobject]@{
+            Available = $true
+            Method = 'PowerShell Remoting'
+            Status = @($remote.Status)
+            Perf = $remote.Perf
+            Error = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available = $false
+            Method = 'PowerShell Remoting unavailable'
+            Status = @()
+            Perf = $null
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+function Update-DOStallTracking {
+    param([object[]]$Updates)
+
+    $now = Get-Date
+    $activeIds = @()
+
+    foreach ($u in @($Updates | Where-Object { [int]$_.EvaluationState -eq 5 })) {
+        $id = [string]$u.UpdateID
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+        $activeIds += $id
+        $pct = [int]$u.PercentComplete
+
+        if (-not $script:DOProgressHistory.ContainsKey($id)) {
+            $script:DOProgressHistory[$id] = [pscustomobject]@{
+                LastPercent = $pct
+                LastChange = $now
+                FirstSeen = $now
+            }
+        }
+        else {
+            $state = $script:DOProgressHistory[$id]
+            if ($pct -ne [int]$state.LastPercent) {
+                $state.LastPercent = $pct
+                $state.LastChange = $now
+            }
+        }
+    }
+
+    foreach ($id in @($script:DOProgressHistory.Keys)) {
+        if ($activeIds -notcontains $id) {
+            $script:DOProgressHistory.Remove($id)
+        }
+    }
+}
+
+function Get-DOStallState {
+    param([object[]]$Updates)
+
+    $downloading = @($Updates | Where-Object { [int]$_.EvaluationState -eq 5 })
+    if ($downloading.Count -eq 0) {
+        return [pscustomobject]@{
+            IsStalled = $false
+            Text = 'Idle'
+            Detail = 'No update is currently in Downloading state.'
+        }
+    }
+
+    $now = Get-Date
+    $stalled = @()
+
+    foreach ($u in $downloading) {
+        $id = [string]$u.UpdateID
+        if (-not $script:DOProgressHistory.ContainsKey($id)) { continue }
+
+        $state = $script:DOProgressHistory[$id]
+        $age = $now - $state.LastChange
+
+        if ([int]$u.PercentComplete -eq 0 -and $age.TotalMinutes -ge $script:DOStallMinutes) {
+            $stalled += $u
+        }
+    }
+
+    if ($stalled.Count -gt 0) {
+        return [pscustomobject]@{
+            IsStalled = $true
+            Text = "STALLED 0% ($($stalled.Count))"
+            Detail = "$($stalled.Count) update(s) remained at 0% for at least $($script:DOStallMinutes) minute(s)."
+        }
+    }
+
+    $pcts = $downloading | ForEach-Object { [int]$_.PercentComplete }
+    return [pscustomobject]@{
+        IsStalled = $false
+        Text = "Downloading ($($downloading.Count))"
+        Detail = "Active download state. Progress values: $($pcts -join ', ')%"
+    }
+}
+
+function Get-DODiagnosticSnapshot {
+    if (-not $script:ConnectedComputer) {
+        throw 'Connect to a computer first.'
+    }
+
+    $policyPath = 'SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'
+    $mode = Get-RemoteRegistryValue -SubKey $policyPath -ValueName 'DODownloadMode' -Type DWORD
+    $groupId = Get-RemoteRegistryValue -SubKey $policyPath -ValueName 'DOGroupId' -Type String
+    if ([string]::IsNullOrWhiteSpace([string]$groupId)) {
+        $groupId = Get-RemoteRegistryValue -SubKey $policyPath -ValueName 'DOGroupID' -Type String
+    }
+    $cacheHost = Get-RemoteRegistryValue -SubKey $policyPath -ValueName 'DOCacheHost' -Type String
+    $modeInfo = Get-DOModeInfo $mode
+
+    $services = Get-ClientServices
+    $doSvc = $services | Where-Object Name -eq 'DoSvc' | Select-Object -First 1
+
+    $port7680 = Get-RemoteTcpListener -Port 7680
+    $port8005 = Get-RemoteTcpListener -Port 8005
+    $stall = Get-DOStallState -Updates $script:CurrentUpdates
+
+    $deep = Get-DODeepMetrics
+
+    [pscustomobject]@{
+        Computer = $script:ConnectedComputer
+        Time = Get-Date
+        DODownloadMode = $modeInfo.Value
+        DODownloadModeName = $modeInfo.Name
+        DOGroupId = if ($groupId) { $groupId } else { 'Not configured' }
+        DOCacheHost = if ($cacheHost) { $cacheHost } else { 'Not configured' }
+        DoSvc = if ($doSvc) { $doSvc.State } else { 'Not found' }
+        Port7680Listening = $port7680
+        Port8005Listening = $port8005
+        Stall = $stall
+        Deep = $deep
+    }
+}
+
+function Format-NullableBool {
+    param([object]$Value)
+    if ($null -eq $Value) { return 'Unknown / not queryable' }
+    if ([bool]$Value) { return 'Yes' }
+    return 'No'
+}
+
+function Convert-DODeepMetricsToText {
+    param([object]$Deep)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    if (-not $Deep.Available) {
+        $lines.Add("Deep metrics: unavailable ($($Deep.Method))")
+        $lines.Add("Reason: $($Deep.Error)")
+        $lines.Add("Note: core monitoring and policy diagnostics still use DCOM and do not depend on WinRM.")
+        return $lines.ToArray()
+    }
+
+    $lines.Add("Deep metrics method: $($Deep.Method)")
+    $lines.Add("")
+
+    $statusItems = @($Deep.Status)
+    if ($statusItems.Count -eq 0) {
+        $lines.Add('Get-DeliveryOptimizationStatus: no current DO jobs returned.')
+    }
+    else {
+        $lines.Add("Current DO jobs: $($statusItems.Count)")
+        foreach ($s in $statusItems) {
+            $fileId = if ($s.FileId) { $s.FileId } else { '<no FileId>' }
+            $lines.Add("  FileId: $fileId")
+            foreach ($p in @(
+                'Status','Priority','TotalSize','BytesFromHttp','BytesFromPeers',
+                'BytesFromLanPeers','BytesFromInternetPeers','BytesFromCacheServer',
+                'DownloadMode','NumPeers','PercentPeerCaching','ErrorCode'
+            )) {
+                if ($s.PSObject.Properties.Name -contains $p) {
+                    $lines.Add(("    {0}: {1}" -f $p, $s.$p))
+                }
+            }
+        }
+    }
+
+    if ($Deep.Perf) {
+        $lines.Add("")
+        $lines.Add('Delivery Optimization performance snapshot:')
+        foreach ($p in $Deep.Perf.PSObject.Properties) {
+            if ($p.Name -match 'Peer|Http|Cache|Byte|Download|Upload|Bandwidth|File') {
+                $lines.Add(("  {0}: {1}" -f $p.Name, $p.Value))
+            }
+        }
+    }
+
+    return $lines.ToArray()
+}
+
+function Save-DODiagnosticBundle {
+    param([object]$Snapshot)
+
+    $base = Join-Path $PSScriptRoot 'DO-Diagnostics'
+    if (-not (Test-Path $base)) {
+        New-Item -ItemType Directory -Path $base -Force | Out-Null
+    }
+
+    $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+    $folder = Join-Path $base ("{0}_{1}" -f $script:ConnectedComputer, $stamp)
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+
+    $summary = New-Object System.Collections.Generic.List[string]
+    $summary.Add("Computer: $($Snapshot.Computer)")
+    $summary.Add("Time: $($Snapshot.Time)")
+    $summary.Add("DODownloadMode: $($Snapshot.DODownloadMode) ($($Snapshot.DODownloadModeName))")
+    $summary.Add("DOGroupId: $($Snapshot.DOGroupId)")
+    $summary.Add("DOCacheHost: $($Snapshot.DOCacheHost)")
+    $summary.Add("DoSvc: $($Snapshot.DoSvc)")
+    $summary.Add("TCP 7680 listening: $(Format-NullableBool $Snapshot.Port7680Listening)")
+    $summary.Add("TCP 8005 listening: $(Format-NullableBool $Snapshot.Port8005Listening)")
+    $summary.Add("Stall state: $($Snapshot.Stall.Text)")
+    $summary.Add("Stall detail: $($Snapshot.Stall.Detail)")
+    $summary.Add("")
+    $summary.AddRange([string[]](Convert-DODeepMetricsToText -Deep $Snapshot.Deep))
+    $summary | Set-Content -LiteralPath (Join-Path $folder 'DO-Summary.txt') -Encoding UTF8
+
+    # Save current Client SDK update state.
+    $script:CurrentUpdates |
+        Select-Object ArticleID,Name,UpdateID,EvaluationState,PercentComplete,ComplianceState,
+            @{N='ErrorCodeHex';E={ Convert-ErrorCode $_.ErrorCode }} |
+        Export-Csv -LiteralPath (Join-Path $folder 'SoftwareUpdates.csv') -NoTypeInformation -Encoding UTF8
+
+    $logRoot = Get-LogRoot
+    foreach ($name in @(
+        'UpdateDOGpo.log','DeltaDownload.log','WUAHandler.log','UpdatesHandler.log',
+        'UpdatesDeployment.log','CAS.log','ContentTransferManager.log','DataTransferService.log'
+    )) {
+        $srcLog = Join-Path $logRoot $name
+        if (Test-Path -LiteralPath $srcLog) {
+            try {
+                Get-Content -LiteralPath $srcLog -Tail 2000 -ErrorAction Stop |
+                    Set-Content -LiteralPath (Join-Path $folder $name) -Encoding UTF8
+            }
+            catch {}
+        }
+    }
+
+    return $folder
+}
+
+function Invoke-ClientSchedule {
+    param([string]$ScheduleId)
+
+    if ($script:CimSession) {
+        $client = Get-CimClass -CimSession $script:CimSession `
+            -Namespace 'root\ccm' -ClassName 'SMS_Client' -ErrorAction Stop
+        return Invoke-CimMethod -CimSession $script:CimSession -CimClass $client `
+            -MethodName 'TriggerSchedule' -Arguments @{ sScheduleID = $ScheduleId } -ErrorAction Stop
+    }
+
+    $client = Get-CimClass -Namespace 'root\ccm' -ClassName 'SMS_Client' -ErrorAction Stop
+    return Invoke-CimMethod -CimClass $client -MethodName 'TriggerSchedule' `
+        -Arguments @{ sScheduleID = $ScheduleId } -ErrorAction Stop
+}
+
+function Restart-RemoteServiceByCim {
+    param([string]$ServiceName)
+
+    if ($script:CimSession) {
+        $svc = Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Service `
+            -Filter "Name='$ServiceName'" -ErrorAction Stop
+        if (-not $svc) { throw "Service $ServiceName not found." }
+
+        if ($svc.State -eq 'Running') {
+            Invoke-CimMethod -CimSession $script:CimSession -InputObject $svc `
+                -MethodName StopService -ErrorAction Stop | Out-Null
+            Start-Sleep -Seconds 2
+        }
+
+        $svc = Get-CimInstance -CimSession $script:CimSession -ClassName Win32_Service `
+            -Filter "Name='$ServiceName'" -ErrorAction Stop
+        Invoke-CimMethod -CimSession $script:CimSession -InputObject $svc `
+            -MethodName StartService -ErrorAction Stop | Out-Null
+    }
+    else {
+        Restart-Service -Name $ServiceName -Force -ErrorAction Stop
+    }
+}
+
+function Invoke-DOSafeRepair {
+    # No DO policy changes. No SoftwareDistribution reset. No CCM client reset.
+    # Capture evidence first, then restart DoSvc and trigger supported ConfigMgr cycles.
+    $snapshot = Get-DODiagnosticSnapshot
+    $folder = Save-DODiagnosticBundle -Snapshot $snapshot
+
+    Restart-RemoteServiceByCim -ServiceName 'DoSvc'
+
+    # Software Updates Assignments Evaluation Cycle
+    [void](Invoke-ClientSchedule -ScheduleId '{00000000-0000-0000-0000-000000000108}')
+
+    # Scan by Update Source
+    [void](Invoke-ClientSchedule -ScheduleId '{00000000-0000-0000-0000-000000000113}')
+
+    return $folder
+}
+
+function Invoke-DOCacheClear {
+    if ($script:ConnectedComputer -eq $env:COMPUTERNAME) {
+        Delete-DeliveryOptimizationCache -Force -IncludePinnedFiles -ErrorAction Stop
+        return
+    }
+
+    Invoke-Command -ComputerName $script:ConnectedComputer -ErrorAction Stop -ScriptBlock {
+        Delete-DeliveryOptimizationCache -Force -IncludePinnedFiles -ErrorAction Stop
+    } | Out-Null
+}
+
+function Show-DODiagnostics {
+    $snapshot = Get-DODiagnosticSnapshot
+
+    $diag = New-Object System.Windows.Forms.Form
+    $diag.Text = "Delivery Optimization Diagnostics - $($snapshot.Computer)"
+    $diag.StartPosition = 'CenterParent'
+    $diag.Size = New-Object System.Drawing.Size(900, 700)
+    $diag.MinimumSize = New-Object System.Drawing.Size(760, 560)
+    $diag.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+    $top = New-Object System.Windows.Forms.Panel
+    $top.Dock = 'Top'
+    $top.Height = 126
+    $diag.Controls.Add($top)
+
+    $lblMode = New-Object System.Windows.Forms.Label
+    $lblMode.Left = 12
+    $lblMode.Top = 10
+    $lblMode.Width = 430
+    $lblMode.Height = 24
+    $lblMode.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+    if ($null -eq $snapshot.DODownloadMode) {
+        $lblMode.Text = 'DO Mode: Not configured / unreadable'
+        $lblMode.ForeColor = [System.Drawing.Color]::DarkRed
+    }
+    else {
+        $lblMode.Text = "DO Mode: $($snapshot.DODownloadMode) ($($snapshot.DODownloadModeName))"
+        $lblMode.ForeColor = [System.Drawing.Color]::DarkGreen
+    }
+    $top.Controls.Add($lblMode)
+
+    $lblGroup = New-Object System.Windows.Forms.Label
+    $lblGroup.Left = 12
+    $lblGroup.Top = 38
+    $lblGroup.Width = 700
+    $lblGroup.Text = "DOGroupId: $($snapshot.DOGroupId)"
+    $top.Controls.Add($lblGroup)
+
+    $lblCache = New-Object System.Windows.Forms.Label
+    $lblCache.Left = 12
+    $lblCache.Top = 60
+    $lblCache.Width = 700
+    $lblCache.Text = "DOCacheHost: $($snapshot.DOCacheHost)"
+    $top.Controls.Add($lblCache)
+
+    $lblHealth = New-Object System.Windows.Forms.Label
+    $lblHealth.Left = 12
+    $lblHealth.Top = 84
+    $lblHealth.Width = 820
+    $lblHealth.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $lblHealth.Text = "DoSvc: $($snapshot.DoSvc)   |   TCP 7680: $(Format-NullableBool $snapshot.Port7680Listening)   |   SCCM Delta 8005: $(Format-NullableBool $snapshot.Port8005Listening)   |   $($snapshot.Stall.Text)"
+    if ($snapshot.Stall.IsStalled) {
+        $lblHealth.ForeColor = [System.Drawing.Color]::DarkRed
+    }
+    else {
+        $lblHealth.ForeColor = [System.Drawing.Color]::DarkGreen
+    }
+    $top.Controls.Add($lblHealth)
+
+    $tabsDiag = New-Object System.Windows.Forms.TabControl
+    $tabsDiag.Dock = 'Fill'
+    $diag.Controls.Add($tabsDiag)
+
+    $tabSummary = New-Object System.Windows.Forms.TabPage
+    $tabSummary.Text = 'Summary'
+    $tabsDiag.TabPages.Add($tabSummary)
+
+    $txtSummary = New-Object System.Windows.Forms.RichTextBox
+    $txtSummary.Dock = 'Fill'
+    $txtSummary.ReadOnly = $true
+    $txtSummary.WordWrap = $false
+    $txtSummary.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $tabSummary.Controls.Add($txtSummary)
+
+    $summaryLines = New-Object System.Collections.Generic.List[string]
+    $summaryLines.Add("Computer        : $($snapshot.Computer)")
+    $summaryLines.Add("DO Mode         : $($snapshot.DODownloadMode) ($($snapshot.DODownloadModeName))")
+    $summaryLines.Add("DOGroupId       : $($snapshot.DOGroupId)")
+    $summaryLines.Add("DOCacheHost     : $($snapshot.DOCacheHost)")
+    $summaryLines.Add("DoSvc           : $($snapshot.DoSvc)")
+    $summaryLines.Add("TCP 7680 listen : $(Format-NullableBool $snapshot.Port7680Listening)")
+    $summaryLines.Add("TCP 8005 listen : $(Format-NullableBool $snapshot.Port8005Listening)")
+    $summaryLines.Add("Download health : $($snapshot.Stall.Text)")
+    $summaryLines.Add("Detail          : $($snapshot.Stall.Detail)")
+    $summaryLines.Add("")
+    $summaryLines.AddRange([string[]](Convert-DODeepMetricsToText -Deep $snapshot.Deep))
+    $txtSummary.Text = ($summaryLines -join [Environment]::NewLine)
+
+    $tabEvidence = New-Object System.Windows.Forms.TabPage
+    $tabEvidence.Text = 'Evidence'
+    $tabsDiag.TabPages.Add($tabEvidence)
+
+    $txtEvidence = New-Object System.Windows.Forms.RichTextBox
+    $txtEvidence.Dock = 'Fill'
+    $txtEvidence.ReadOnly = $true
+    $txtEvidence.WordWrap = $false
+    $txtEvidence.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $tabEvidence.Controls.Add($txtEvidence)
+
+    $evidence = New-Object System.Collections.Generic.List[string]
+    $logRoot = Get-LogRoot
+    foreach ($logName in @('UpdateDOGpo.log','DeltaDownload.log','WUAHandler.log','ContentTransferManager.log','CAS.log')) {
+        $evidence.Add("===== $logName =====")
+        try {
+            $lines = Get-InterestingLogLines -Path (Join-Path $logRoot $logName) -Tail 250
+            foreach ($line in ($lines | Select-Object -Last 35)) { $evidence.Add($line) }
+        }
+        catch {
+            $evidence.Add("Unable to read: $($_.Exception.Message)")
+        }
+        $evidence.Add("")
+    }
+    $txtEvidence.Text = ($evidence -join [Environment]::NewLine)
+
+    $bottom = New-Object System.Windows.Forms.Panel
+    $bottom.Dock = 'Bottom'
+    $bottom.Height = 52
+    $diag.Controls.Add($bottom)
+
+    $btnSaveDiag = New-Object System.Windows.Forms.Button
+    $btnSaveDiag.Text = 'Save Diagnostic Bundle'
+    $btnSaveDiag.Left = 12
+    $btnSaveDiag.Top = 10
+    $btnSaveDiag.Width = 155
+    $bottom.Controls.Add($btnSaveDiag)
+
+    $btnSafeRepair = New-Object System.Windows.Forms.Button
+    $btnSafeRepair.Text = 'Safe DO Repair'
+    $btnSafeRepair.Left = 178
+    $btnSafeRepair.Top = 10
+    $btnSafeRepair.Width = 125
+    $bottom.Controls.Add($btnSafeRepair)
+
+    $btnClearCache = New-Object System.Windows.Forms.Button
+    $btnClearCache.Text = 'Clear DO Cache'
+    $btnClearCache.Left = 314
+    $btnClearCache.Top = 10
+    $btnClearCache.Width = 125
+    $bottom.Controls.Add($btnClearCache)
+
+    $btnCloseDiag = New-Object System.Windows.Forms.Button
+    $btnCloseDiag.Text = 'Close'
+    $btnCloseDiag.Left = 450
+    $btnCloseDiag.Top = 10
+    $btnCloseDiag.Width = 90
+    $bottom.Controls.Add($btnCloseDiag)
+
+    $btnSaveDiag.Add_Click({
+        try {
+            $folder = Save-DODiagnosticBundle -Snapshot $snapshot
+            [System.Windows.Forms.MessageBox]::Show(
+                "Diagnostic bundle saved to:`r`n$folder",
+                'DO Diagnostics',
+                'OK',
+                'Information'
+            ) | Out-Null
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'DO Diagnostics','OK','Error') | Out-Null
+        }
+    })
+
+    $btnSafeRepair.Add_Click({
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "This action will:`r`n`r`n1. Save a diagnostic bundle FIRST`r`n2. Restart DoSvc`r`n3. Trigger SCCM Software Updates Assignments Evaluation`r`n4. Trigger Scan by Update Source`r`n`r`nIt will NOT change DODownloadMode, reset SoftwareDistribution, or reset the SCCM client.`r`n`r`nContinue?",
+            'Confirm Safe DO Repair',
+            'YesNo',
+            'Warning'
+        )
+
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        try {
+            $folder = Invoke-DOSafeRepair
+            [System.Windows.Forms.MessageBox]::Show(
+                "Safe repair completed.`r`nEvidence saved to:`r`n$folder`r`n`r`nThe main monitor will continue tracking progress.",
+                'Safe DO Repair',
+                'OK',
+                'Information'
+            ) | Out-Null
+            Refresh-Monitor
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message,'Safe DO Repair','OK','Error') | Out-Null
+        }
+    })
+
+    $btnClearCache.Add_Click({
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "Clear the Delivery Optimization cache on $($script:ConnectedComputer)?`r`n`r`nThis uses the Microsoft Delete-DeliveryOptimizationCache cmdlet.`r`nA diagnostic bundle will be saved first.`r`n`r`nRemote use requires PowerShell Remoting (WinRM).",
+            'Confirm Clear DO Cache',
+            'YesNo',
+            'Warning'
+        )
+
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+        try {
+            $before = Get-DODiagnosticSnapshot
+            $folder = Save-DODiagnosticBundle -Snapshot $before
+            Invoke-DOCacheClear
+
+            [System.Windows.Forms.MessageBox]::Show(
+                "DO cache cleared.`r`nPre-change evidence saved to:`r`n$folder",
+                'Clear DO Cache',
+                'OK',
+                'Information'
+            ) | Out-Null
+            Refresh-Monitor
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "DO cache clear failed.`r`n`r`n$($_.Exception.Message)`r`n`r`nNo DO policy was changed.",
+                'Clear DO Cache',
+                'OK',
+                'Error'
+            ) | Out-Null
+        }
+    })
+
+    $btnCloseDiag.Add_Click({ $diag.Close() })
+
+    [void]$diag.ShowDialog($form)
+}
+
 # -----------------------------
 # Form
 # -----------------------------
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'SCCM Software Update Live Monitor'
+$form.Text = 'SCCM Software Update Live Monitor v1.3'
 $form.StartPosition = 'CenterScreen'
 $form.Size = New-Object System.Drawing.Size(1420, 900)
 $form.MinimumSize = New-Object System.Drawing.Size(1180, 720)
@@ -412,7 +1083,7 @@ $topPanel.BackColor = [System.Drawing.Color]::White
 $form.Controls.Add($topPanel)
 
 $title = New-Object System.Windows.Forms.Label
-$title.Text = 'SCCM Software Update Live Monitor'
+$title.Text = 'SCCM Software Update Live Monitor v1.3'
 $title.Font = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
 $title.Left = 16
 $title.Top = 9
@@ -522,11 +1193,33 @@ $main.Dock = 'Fill'
 $main.Padding = New-Object System.Windows.Forms.Padding(12)
 $form.Controls.Add($main)
 
+# Explicit row layout prevents the SplitContainer from rendering underneath
+# the summary/service panels (the v1.1 blank-grid bug).
+$contentLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$contentLayout.Dock = 'Fill'
+$contentLayout.ColumnCount = 1
+$contentLayout.RowCount = 3
+$contentLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+$contentLayout.Padding = New-Object System.Windows.Forms.Padding(0)
+[void]$contentLayout.ColumnStyles.Add(
+    (New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))
+)
+[void]$contentLayout.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 78))
+)
+[void]$contentLayout.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 38))
+)
+[void]$contentLayout.RowStyles.Add(
+    (New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))
+)
+$main.Controls.Add($contentLayout)
+
 # Summary
 $summaryPanel = New-Object System.Windows.Forms.Panel
-$summaryPanel.Dock = 'Top'
-$summaryPanel.Height = 78
-$main.Controls.Add($summaryPanel)
+$summaryPanel.Dock = 'Fill'
+$summaryPanel.Margin = New-Object System.Windows.Forms.Padding(0)
+$contentLayout.Controls.Add($summaryPanel, 0, 0)
 
 $cards = @{}
 $x = 0
@@ -547,9 +1240,9 @@ foreach ($item in @(
 
 # Services status
 $servicePanel = New-Object System.Windows.Forms.Panel
-$servicePanel.Dock = 'Top'
-$servicePanel.Height = 38
-$main.Controls.Add($servicePanel)
+$servicePanel.Dock = 'Fill'
+$servicePanel.Margin = New-Object System.Windows.Forms.Padding(0)
+$contentLayout.Controls.Add($servicePanel, 0, 1)
 
 $lblServices = New-Object System.Windows.Forms.Label
 $lblServices.Text = 'Services:'
@@ -572,14 +1265,40 @@ foreach ($svc in @('CcmExec','DoSvc','wuauserv','BITS')) {
     $sx += 160
 }
 
+$lblDOMode = New-Object System.Windows.Forms.Label
+$lblDOMode.Text = 'DO Mode: -'
+$lblDOMode.Left = $sx
+$lblDOMode.Top = 10
+$lblDOMode.Width = 160
+$servicePanel.Controls.Add($lblDOMode)
+$sx += 165
+
+$lblDOHealth = New-Object System.Windows.Forms.Label
+$lblDOHealth.Text = 'DO: -'
+$lblDOHealth.Left = $sx
+$lblDOHealth.Top = 10
+$lblDOHealth.Width = 200
+$servicePanel.Controls.Add($lblDOHealth)
+$sx += 205
+
+$btnDODiagnostics = New-Object System.Windows.Forms.Button
+$btnDODiagnostics.Text = 'DO Diagnostics'
+$btnDODiagnostics.Left = $sx
+$btnDODiagnostics.Top = 5
+$btnDODiagnostics.Width = 115
+$btnDODiagnostics.Height = 27
+$btnDODiagnostics.Enabled = $false
+$servicePanel.Controls.Add($btnDODiagnostics)
+
 # Split container
 $split = New-Object System.Windows.Forms.SplitContainer
 $split.Dock = 'Fill'
+$split.Margin = New-Object System.Windows.Forms.Padding(0)
 $split.Orientation = 'Horizontal'
 $split.SplitterDistance = 390
 $split.Panel1MinSize = 220
 $split.Panel2MinSize = 190
-$main.Controls.Add($split)
+$contentLayout.Controls.Add($split, 0, 2)
 
 # Grid
 $grid = New-Object System.Windows.Forms.DataGridView
@@ -596,6 +1315,10 @@ $grid.BackgroundColor = [System.Drawing.Color]::White
 $grid.BorderStyle = 'FixedSingle'
 $grid.EnableHeadersVisualStyles = $false
 $grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+$grid.ColumnHeadersHeight = 30
+$grid.RowTemplate.Height = 28
+$grid.AutoGenerateColumns = $false
+$grid.Visible = $true
 $split.Panel1.Controls.Add($grid)
 
 [void]$grid.Columns.Add('KB','KB')
@@ -672,7 +1395,7 @@ function Update-GridAndSummary {
             $kb,
             [string]$u.Name,
             $stateName,
-            [string]$u.PercentComplete,
+            ('{0}%' -f [int]$u.PercentComplete),
             $compliance,
             $errorText
         )
@@ -754,10 +1477,50 @@ function Refresh-Monitor {
     try {
         $updates = Get-ClientUpdates
         $script:CurrentUpdates = @($updates)
+        Update-DOStallTracking -Updates $updates
         $services = Get-ClientServices
 
-        Update-GridAndSummary -Updates $updates
+        try {
+            Update-GridAndSummary -Updates $updates
+            $grid.Refresh()
+        }
+        catch {
+            throw "Grid update failed: $($_.Exception.Message)"
+        }
+
         Update-ServiceDisplay -Services $services
+
+        $modeRaw = Get-RemoteRegistryValue `
+            -SubKey 'SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' `
+            -ValueName 'DODownloadMode' -Type DWORD
+        $modeInfo = Get-DOModeInfo $modeRaw
+        if ($null -eq $modeInfo.Value) {
+            $lblDOMode.Text = 'DO Mode: Not set'
+            $lblDOMode.ForeColor = [System.Drawing.Color]::DarkRed
+        }
+        else {
+            $lblDOMode.Text = "DO Mode: $($modeInfo.Value) ($($modeInfo.Name))"
+            if ([int]$modeInfo.Value -eq 1) {
+                $lblDOMode.ForeColor = [System.Drawing.Color]::DarkGreen
+            }
+            else {
+                $lblDOMode.ForeColor = [System.Drawing.Color]::DarkOrange
+            }
+        }
+
+        $doHealth = Get-DOStallState -Updates $updates
+        $lblDOHealth.Text = "DO: $($doHealth.Text)"
+        if ($doHealth.IsStalled) {
+            $lblDOHealth.ForeColor = [System.Drawing.Color]::DarkRed
+        }
+        elseif (@($updates | Where-Object { [int]$_.EvaluationState -eq 5 }).Count -gt 0) {
+            $lblDOHealth.ForeColor = [System.Drawing.Color]::DarkGreen
+        }
+        else {
+            $lblDOHealth.ForeColor = [System.Drawing.Color]::DimGray
+        }
+
+        $btnDODiagnostics.Enabled = $true
 
         $logRoot = Get-LogRoot
         foreach ($name in $logBoxes.Keys) {
@@ -864,6 +1627,20 @@ $txtComputer.Add_KeyDown({
     if ($_.KeyCode -eq 'Enter') {
         $btnConnect.PerformClick()
         $_.SuppressKeyPress = $true
+    }
+})
+
+$btnDODiagnostics.Add_Click({
+    try {
+        Show-DODiagnostics
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            $_.Exception.Message,
+            'DO Diagnostics',
+            'OK',
+            'Error'
+        ) | Out-Null
     }
 })
 
@@ -986,5 +1763,5 @@ $form.Add_FormClosing({
 })
 
 # Connect automatically to local machine on startup only when explicitly launched locally.
-$statusLabel.Text = 'Enter a computer name and click Connect.'
+$statusLabel.Text = 'v1.3 ready - enter a computer name and click Connect.'
 [void]$form.ShowDialog()
