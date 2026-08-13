@@ -452,7 +452,7 @@ $serviceLabels = @{}
 $sx = 70
 foreach ($svc in @('CcmExec','DoSvc','wuauserv','BITS')) {
     $l = New-Object System.Windows.Forms.Label
-    $l.Text = "$svc: -"
+    $l.Text = "${svc}: -"
     $l.Left = $sx
     $l.Top = 10
     $l.Width = 150
@@ -618,7 +618,7 @@ function Update-ServiceDisplay {
     foreach ($name in $serviceLabels.Keys) {
         $svc = $Services | Where-Object Name -eq $name | Select-Object -First 1
         if ($svc) {
-            $serviceLabels[$name].Text = "$name: $($svc.State)"
+            $serviceLabels[$name].Text = "${name}: $($svc.State)"
             if ($svc.State -eq 'Running') {
                 $serviceLabels[$name].ForeColor = [System.Drawing.Color]::DarkGreen
             } else {
@@ -626,7 +626,7 @@ function Update-ServiceDisplay {
             }
         }
         else {
-            $serviceLabels[$name].Text = "$name: Not found"
+            $serviceLabels[$name].Text = "${name}: Not found"
             $serviceLabels[$name].ForeColor = [System.Drawing.Color]::DarkRed
         }
     }
